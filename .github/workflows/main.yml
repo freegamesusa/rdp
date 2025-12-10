@@ -1,38 +1,221 @@
-      - name: Configure Windows Firewall and Network
+name: RDP with Tailscale
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      # Step 1: Configure RDP - FIXED VERSION
+      - name: Configure RDP Settings
         run: |
-          # Set ALL network adapters to Private (CRITICAL for RDP)
-          Get-NetAdapter | ForEach-Object {
-              $profile = Get-NetConnectionProfile -InterfaceIndex $_.InterfaceIndex
-              if ($profile) {
-                  Set-NetConnectionProfile -InterfaceIndex $_.InterfaceIndex -NetworkCategory Private
-              }
-          }
+          Write-Host "=== Enabling RDP on Windows Server 2025 ==="
           
-          # Enable ALL RDP firewall rules (not just one)
+          # 1. Enable RDP in registry (THIS WAS MISSING!)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # 2. Disable Network Level Authentication (NLA)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          
+          # 3. Set appropriate security layer
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 1 -Force
+          
+          # 4. Force network to Private (CRITICAL for Windows Server)
+          Set-NetConnectionProfile -All -NetworkCategory Private
+          
+          # 5. Configure firewall - allow all RDP connections
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
-          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
           
-          # Add explicit rule for Tailscale interface
-          New-NetFirewallRule -DisplayName "RDP-Tailscale-All" `
+          # Add explicit firewall rule
+          New-NetFirewallRule -DisplayName "RDP-Allow-Tailscale" `
             -Direction Inbound `
             -LocalPort 3389 `
             -Protocol TCP `
             -Action Allow `
             -ErrorAction SilentlyContinue
-
-      - name: Final RDP Configuration
-        run: |
-          # Double-check registry settings
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
           
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 0 -Force
-          
-          # Restart services
+          # 6. Restart RDP services
           Restart-Service TermService -Force
-          Restart-Service SessionEnv -Force  # Needed for Remote Desktop Services
+          Restart-Service SessionEnv -Force
           
-          # Verify RDP is listening
-          netstat -an | findstr :3389
+          Write-Host "RDP configuration complete"
+
+      # Step 2: Create RDP User - FIXED VERSION
+      - name: Create RDP User
+        run: |
+          Write-Host "=== Creating RDP User ==="
+          
+          # Generate SIMPLE password without problematic special characters
+          $charPool = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+          $password = -join ((1..16) | ForEach-Object { $charPool[(Get-Random -Minimum 0 -Maximum $charPool.Length)] })
+          
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Remove existing user if exists
+          $existingUser = Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue
+          if ($existingUser) {
+              Remove-LocalUser -Name "RDPUser"
+          }
+          
+          # Create new user
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          Enable-LocalUser -Name "RDPUser"
+          
+          # Store credentials
+          echo "RDP_USER=RDPUser" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          Write-Host "User created: RDPUser"
+          Write-Host "Password: $password"
+
+      # Step 3: Install Tailscale
+      - name: Install Tailscale
+        run: |
+          Write-Host "=== Installing Tailscale ==="
+          
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          # Download and install
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -Wait -ArgumentList @(
+            "/i", "`"$installerPath`"",
+            "/quiet",
+            "/norestart",
+            "ACCEPTEULA=yes"
+          )
+          
+          # Cleanup
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          
+          Write-Host "Tailscale installed"
+
+      # Step 4: Connect Tailscale - FIXED VERSION
+      - name: Connect Tailscale
+        run: |
+          Write-Host "=== Connecting Tailscale ==="
+          
+          # Wait for Tailscale service
+          Start-Sleep -Seconds 10
+          
+          # Connect with auth key
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID `
+            --accept-routes `
+            --accept-dns=false
+          
+          # Wait for IP assignment
+          $maxRetries = 30
+          $retryCount = 0
+          $tailscaleIP = $null
+          
+          while (-not $tailscaleIP -and $retryCount -lt $maxRetries) {
+              $tailscaleIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if (-not $tailscaleIP) {
+                  $retryCount++
+                  Write-Host "Waiting for Tailscale IP... ($retryCount/$maxRetries)"
+                  Start-Sleep -Seconds 5
+              }
+          }
+          
+          if (-not $tailscaleIP) {
+              Write-Error "Failed to get Tailscale IP after $maxRetries attempts"
+              exit 1
+          }
+          
+          # Store IP
+          echo "TAILSCALE_IP=$tailscaleIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tailscaleIP"
+
+      # Step 5: Verify RDP is Working - NEW CRITICAL STEP
+      - name: Verify RDP Connectivity
+        run: |
+          Write-Host "=== Verifying RDP Setup ==="
+          
+          # Check RDP service
+          $service = Get-Service TermService
+          Write-Host "1. RDP Service Status: $($service.Status)"
+          
+          # Check registry setting
+          $rdpEnabled = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                                         -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
+          Write-Host "2. RDP Enabled in Registry: $(if ($rdpEnabled.fDenyTSConnections -eq 0) {'YES'} else {'NO'})"
+          
+          # Check listening port
+          $listening = netstat -an | Select-String ":3389" | Select-String "LISTENING"
+          Write-Host "3. Port 3389 Listening: $(if ($listening) {'YES'} else {'NO'})"
+          
+          # Test local connection
+          $testResult = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+          Write-Host "4. Local RDP Test: $(if ($testResult.TcpTestSucceeded) {'SUCCESS'} else {'FAILED'})"
+          
+          # Display user info
+          $user = Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
+          Write-Host "5. RDP User Status: $(if ($user.Enabled) {'ENABLED'} else {'DISABLED'})"
+          
+          # Emergency fallback if RDP not working
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Host "WARNING: RDP may not be working. Enabling PowerShell Remoting as fallback..."
+              Enable-PSRemoting -Force -SkipNetworkProfileCheck
+              Set-Item WSMan:\localhost\Client\TrustedHosts -Value * -Force
+              Restart-Service WinRM
+              Write-Host "PowerShell Remoting enabled as backup"
+          }
+          
+          Write-Host "=== Verification Complete ==="
+
+      # Step 6: Display Connection Info - IMPROVED VERSION
+      - name: Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "            RDP ACCESS READY"
+          Write-Host "=============================================="
+          Write-Host "Address:    $env:TAILSCALE_IP"
+          Write-Host "Username:   $env:RDP_USER"
+          Write-Host "Password:   $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "CONNECTION INSTRUCTIONS:"
+          Write-Host "1. Ensure Tailscale is running on YOUR computer"
+          Write-Host "2. Open Remote Desktop Connection (mstsc.exe)"
+          Write-Host "3. Computer: $env:TAILSCALE_IP"
+          Write-Host "4. Username: $env:RDP_USER"
+          Write-Host "5. Password: $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "ALTERNATIVE (if RDP fails):"
+          Write-Host "PowerShell: Enter-PSSession -ComputerName $env:TAILSCALE_IP"
+          Write-Host "Credentials: $env:RDP_USER / $env:RDP_PASSWORD"
+          Write-Host "=============================================="
+          Write-Host ""
+
+      # Step 7: Keep Runner Alive
+      - name: Maintain Active Connection
+        run: |
+          Write-Host "=== RDP Session Active ==="
+          Write-Host "Press Ctrl+C in GitHub Actions to stop"
+          Write-Host ""
+          
+          # Keep alive with periodic status
+          $counter = 0
+          while ($true) {
+              $counter++
+              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              
+              # Display status every 5 minutes
+              if ($counter % 12 -eq 0) {  # 12 * 25 seconds = 5 minutes
+                  Write-Host "[$timestamp] RDP Active - IP: $env:TAILSCALE_IP"
+                  Write-Host "User: $env:RDP_USER | Tailscale status:"
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" status --brief
+              }
+              
+              # Keep runner from timing out
+              Start-Sleep -Seconds 25
+          }
